@@ -34,9 +34,9 @@ import (
 // gVisor TCP. Linux TUN normally also enables RX checksum offload, which these
 // benches turn on; TX checksums stay on, matching the library default.
 //
-// "default" uses NewGVisorStack's 20 KiB TCP windows and a 1500-byte MTU.
-// "large" raises the MTU to 64 KiB and the windows to 4 MiB so the window and
-// per-packet overhead are not the limit.
+// "default" uses NewGVisorStack as-is (gVisor windows: 1 MiB, autotuned to
+// 4 MiB) and a 1500-byte MTU. "mtu64k" keeps those windows and raises the MTU
+// to 64 KiB. "large" also pins the windows at 4 MiB.
 
 const (
 	gvisorBenchMTU      = 1500
@@ -121,6 +121,7 @@ func BenchmarkGVisorTCPUpload(b *testing.B) {
 	}{
 		{"default/1conn", gvisorBenchMTU, 0, 1},
 		{"default/4conn", gvisorBenchMTU, 0, 4},
+		{"mtu64k/1conn", gvisorBenchLargeMTU, 0, 1},
 		{"large/1conn", gvisorBenchLargeMTU, gvisorBenchLargeBuf, 1},
 		{"large/4conn", gvisorBenchLargeMTU, gvisorBenchLargeBuf, 4},
 	} {
@@ -139,6 +140,7 @@ func BenchmarkGVisorTCPDownload(b *testing.B) {
 	}{
 		{"default/1conn", gvisorBenchMTU, 0, 1},
 		{"default/4conn", gvisorBenchMTU, 0, 4},
+		{"mtu64k/1conn", gvisorBenchLargeMTU, 0, 1},
 		{"large/1conn", gvisorBenchLargeMTU, gvisorBenchLargeBuf, 1},
 		{"large/4conn", gvisorBenchLargeMTU, gvisorBenchLargeBuf, 4},
 	} {
