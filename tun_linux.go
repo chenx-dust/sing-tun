@@ -37,6 +37,7 @@ type NativeTun struct {
 	readAccess        sync.Mutex
 	writeAccess       sync.Mutex
 	vnetHdr           bool
+	multiQueue        bool
 	writeBuffer       []byte
 	gsoToWrite        []int
 	tcpGROTable       *tcpGROTable
@@ -49,7 +50,7 @@ type NativeTun struct {
 func New(options Options) (Tun, error) {
 	var nativeTun *NativeTun
 	if options.FileDescriptor == 0 {
-		tunFd, err := open(options.Name, options.GSO)
+		tunFd, multiQueue, err := open(options.Name, options.GSO, options.MultiQueue)
 		if err != nil {
 			return nil, err
 		}
@@ -58,9 +59,10 @@ func New(options Options) (Tun, error) {
 			return nil, E.Errors(err, unix.Close(tunFd))
 		}
 		nativeTun = &NativeTun{
-			tunFd:   tunFd,
-			tunFile: os.NewFile(uintptr(tunFd), "tun"),
-			options: options,
+			tunFd:      tunFd,
+			tunFile:    os.NewFile(uintptr(tunFd), "tun"),
+			options:    options,
+			multiQueue: multiQueue,
 		}
 		err = nativeTun.configure(tunLink)
 		if err != nil {
@@ -105,6 +107,43 @@ func (t *NativeTun) Read(p []byte) (n int, err error) {
 	} else {
 		return t.tunFile.Read(p)
 	}
+}
+
+// parseVirtioRead strips the virtio header from in and returns the GSO options
+// it describes, without splitting the packet.
+func parseVirtioRead(in []byte) ([]byte, GSOOptions, error) {
+	var hdr virtioNetHdr
+	err := hdr.decode(in)
+	if err != nil {
+		return nil, GSOOptions{}, err
+	}
+	in = in[virtioNetHdrLen:]
+
+	options, err := hdr.toGSOOptions()
+	if err != nil {
+		return nil, GSOOptions{}, err
+	}
+
+	// Don't trust HdrLen from the kernel as it can be equal to the length
+	// of the entire first packet when the kernel is handling it as part of a
+	// FORWARD path. Instead, parse the transport header length and add it onto
+	// CsumStart, which is synonymous for IP header length.
+	if options.GSOType == GSOUDPL4 {
+		options.HdrLen = options.CsumStart + 8
+	} else if options.GSOType != GSONone {
+		if len(in) <= int(options.CsumStart+12) {
+			return nil, GSOOptions{}, errors.New("packet is too short")
+		}
+
+		tcpHLen := uint16(in[options.CsumStart+12] >> 4 * 4)
+		if tcpHLen < 20 || tcpHLen > 60 {
+			// A TCP header must be between 20 and 60 bytes in length.
+			return nil, GSOOptions{}, fmt.Errorf("tcp header len is invalid: %d", tcpHLen)
+		}
+		options.HdrLen = options.CsumStart + tcpHLen
+	}
+
+	return in, options, nil
 }
 
 // handleVirtioRead splits in into bufs, leaving offset bytes at the front of
@@ -272,7 +311,30 @@ func init() {
 	}
 }
 
-func open(name string, vnetHdr bool) (int, error) {
+// A persistent device created without IFF_MULTI_QUEUE refuses the flag with EINVAL
+// (tun_set_iff), so the plain flags are retried and such a device stays single-queue.
+func open(name string, vnetHdr bool, multiQueue bool) (int, bool, error) {
+	flags := uint16(unix.IFF_TUN | unix.IFF_NO_PI)
+	if vnetHdr {
+		flags |= unix.IFF_VNET_HDR
+	}
+	if multiQueue {
+		fd, err := openTun(name, flags|unix.IFF_MULTI_QUEUE)
+		if err == nil {
+			return fd, true, nil
+		}
+		if !errors.Is(err, unix.EINVAL) {
+			return -1, false, err
+		}
+	}
+	fd, err := openTun(name, flags)
+	if err != nil {
+		return -1, false, err
+	}
+	return fd, false, nil
+}
+
+func openTun(name string, flags uint16) (int, error) {
 	fd, err := unix.Open(controlPath, unix.O_RDWR, 0)
 	if err != nil {
 		return -1, err
@@ -285,10 +347,7 @@ func open(name string, vnetHdr bool) (int, error) {
 	}
 
 	copy(ifr.name[:], name)
-	ifr.flags = unix.IFF_TUN | unix.IFF_NO_PI
-	if vnetHdr {
-		ifr.flags |= unix.IFF_VNET_HDR
-	}
+	ifr.flags = flags
 	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), unix.TUNSETIFF, uintptr(unsafe.Pointer(&ifr)))
 	if errno != 0 {
 		unix.Close(fd)
@@ -301,6 +360,39 @@ func open(name string, vnetHdr bool) (int, error) {
 	}
 
 	return fd, nil
+}
+
+// openQueue attaches another queue to a multi-queue device for the go stack.
+func (t *NativeTun) openQueue() (int, error) {
+	if !t.multiQueue {
+		return -1, E.New("tun device is not multi-queue")
+	}
+	flags := uint16(unix.IFF_TUN | unix.IFF_NO_PI | unix.IFF_MULTI_QUEUE)
+	if t.options.GSO {
+		flags |= unix.IFF_VNET_HDR
+	}
+	return openTun(t.options.Name, flags)
+}
+
+func (t *NativeTun) rawFileDescriptor() int {
+	return t.tunFd
+}
+
+// os.NewFile registers a non-blocking descriptor with the runtime poller, which then wakes an
+// idle thread for every packet the go stack's engine loop is already waiting for on its own epoll.
+func (t *NativeTun) detachRuntimePoller() error {
+	duplicated, err := unix.FcntlInt(uintptr(t.tunFd), unix.F_DUPFD_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	previous := t.tunFile
+	t.tunFd = duplicated
+	t.tunFile = newUnpolledFile(duplicated, "tun")
+	return previous.Close()
+}
+
+func (t *NativeTun) vnetHeaderEnabled() (bool, error) {
+	return checkVNETHDREnabled(t.tunFd, t.options.Name)
 }
 
 func (t *NativeTun) configure(tunLink netlink.Link) error {
