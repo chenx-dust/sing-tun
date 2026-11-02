@@ -36,6 +36,8 @@ type StackOptions struct {
 	InterfaceFinder        control.InterfaceFinder
 	TCPCongestionControl   string
 	EnforceBindInterface   bool
+	// MemoryPressure lets the go stack shrink its buffer pools; optional.
+	MemoryPressure func() MemoryPressure
 }
 
 func NewStack(
@@ -45,6 +47,8 @@ func NewStack(
 	switch stack {
 	case "", "mips":
 		return NewMipstack(options)
+	case "go":
+		return NewGo(options)
 	case "gvisor":
 		return NewGVisor(options)
 	case "mixed":
